@@ -213,7 +213,7 @@ impl Blockstore {
         delete_range_timer.stop();
 
         let mut write_timer = Measure::start("write_batch");
-        self.db.write(write_batch).inspect(|e| {
+        self.db.write(write_batch).inspect_err(|e| {
             error!(
                 "Error: {:?} while submitting write batch for purge from_slot {} to_slot {}",
                 e, from_slot, to_slot
@@ -455,7 +455,8 @@ impl Blockstore {
         for slot in from_slot..=to_slot {
             let primary_indexes = slot_indexes(slot);
 
-            let slot_entries = self.get_any_valid_slot_entries(slot, 0);
+            let (slot_entries, _, _) =
+                self.get_slot_entries_with_shred_info(slot, 0, true /* allow_dead_slots */)?;
             let transactions = slot_entries
                 .into_iter()
                 .flat_map(|entry| entry.transactions);

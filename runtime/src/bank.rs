@@ -98,14 +98,17 @@ use {
     solana_program_runtime::{
         compute_budget_processor::process_compute_budget_instructions,
         invoke_context::BuiltinFunctionWithContext,
-        loaded_programs::{LoadedProgram, LoadedProgramType, LoadedPrograms},
+        loaded_programs::{
+            LoadedProgram, LoadedProgramMatchCriteria, LoadedProgramType, ProgramCache,
+            ProgramRuntimeEnvironments,
+        },
+        runtime_config::RuntimeConfig,
         timings::{ExecuteTimingType, ExecuteTimings},
     },
     solana_sdk::{
         account::{
-            create_account_shared_data_with_fields as create_account, create_executable_meta,
-            from_account, Account, AccountSharedData, InheritableAccountFields, ReadableAccount,
-            WritableAccount,
+            create_account_shared_data_with_fields as create_account, from_account, Account,
+            AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
         },
         clock::{
             BankId, Epoch, Slot, SlotCount, SlotIndex, UnixTimestamp, DEFAULT_HASHES_PER_TICK,
@@ -163,10 +166,10 @@ use {
     solana_svm::{
         account_loader::{TransactionCheckResult, TransactionLoadResult},
         account_overrides::AccountOverrides,
-        runtime_config::RuntimeConfig,
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_processor::{
-            TransactionBatchProcessor, TransactionLogMessages, TransactionProcessingCallback,
+            ExecutionRecordingConfig, TransactionBatchProcessor, TransactionLogMessages,
+            TransactionProcessingCallback,
         },
         transaction_results::{
             TransactionExecutionDetails, TransactionExecutionResult, TransactionResults,
@@ -544,9 +547,10 @@ impl PartialEq for Bank {
             accounts_data_size_delta_off_chain: _,
             fee_structure: _,
             incremental_snapshot_persistence: _,
-            loaded_programs_cache: _,
+            program_cache: _,
             epoch_reward_status: _,
             transaction_processor: _,
+            check_program_modification_slot: _,
             // Ignore new fields explicitly if they do not impact PartialEq.
             // Adding ".." will remove compile-time checks that if a new field
             // is added to the struct, this PartialEq is accordingly updated.
@@ -802,11 +806,13 @@ pub struct Bank {
 
     pub incremental_snapshot_persistence: Option<BankIncrementalSnapshotPersistence>,
 
-    pub loaded_programs_cache: Arc<RwLock<LoadedPrograms<BankForks>>>,
+    program_cache: Arc<RwLock<ProgramCache<BankForks>>>,
 
     epoch_reward_status: EpochRewardStatus,
 
     transaction_processor: TransactionBatchProcessor<BankForks>,
+
+    check_program_modification_slot: bool,
 }
 
 struct VoteWithStakeDelegations {
@@ -987,12 +993,13 @@ impl Bank {
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
             accounts_data_size_delta_off_chain: AtomicI64::new(0),
             fee_structure: FeeStructure::default(),
-            loaded_programs_cache: Arc::new(RwLock::new(LoadedPrograms::new(
+            program_cache: Arc::new(RwLock::new(ProgramCache::new(
                 Slot::default(),
                 Epoch::default(),
             ))),
             epoch_reward_status: EpochRewardStatus::default(),
             transaction_processor: TransactionBatchProcessor::default(),
+            check_program_modification_slot: false,
         };
 
         bank.transaction_processor = TransactionBatchProcessor::new(
@@ -1001,7 +1008,7 @@ impl Bank {
             bank.epoch_schedule.clone(),
             bank.fee_structure.clone(),
             bank.runtime_config.clone(),
-            bank.loaded_programs_cache.clone(),
+            bank.program_cache.clone(),
         );
 
         let accounts_data_size_initial = bank.get_total_accounts_stats().unwrap().data_len as u64;
@@ -1308,9 +1315,10 @@ impl Bank {
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
             accounts_data_size_delta_off_chain: AtomicI64::new(0),
             fee_structure: parent.fee_structure.clone(),
-            loaded_programs_cache: parent.loaded_programs_cache.clone(),
+            program_cache: parent.program_cache.clone(),
             epoch_reward_status: parent.epoch_reward_status.clone(),
             transaction_processor: TransactionBatchProcessor::default(),
+            check_program_modification_slot: false,
         };
 
         new.transaction_processor = TransactionBatchProcessor::new(
@@ -1319,7 +1327,7 @@ impl Bank {
             new.epoch_schedule.clone(),
             new.fee_structure.clone(),
             new.runtime_config.clone(),
-            new.loaded_programs_cache.clone(),
+            new.program_cache.clone(),
         );
 
         let (_, ancestors_time_us) = measure_us!({
@@ -1359,13 +1367,12 @@ impl Bank {
                     .min(slots_in_epoch)
                     .checked_div(2)
                     .unwrap();
-            let mut loaded_programs_cache = new.loaded_programs_cache.write().unwrap();
-            if loaded_programs_cache.upcoming_environments.is_some() {
-                if let Some((key, program_to_recompile)) =
-                    loaded_programs_cache.programs_to_recompile.pop()
+            let mut program_cache = new.program_cache.write().unwrap();
+            if program_cache.upcoming_environments.is_some() {
+                if let Some((key, program_to_recompile)) = program_cache.programs_to_recompile.pop()
                 {
-                    let effective_epoch = loaded_programs_cache.latest_root_epoch.saturating_add(1);
-                    drop(loaded_programs_cache);
+                    let effective_epoch = program_cache.latest_root_epoch.saturating_add(1);
+                    drop(program_cache);
                     let recompiled = new.load_program(&key, false, effective_epoch);
                     recompiled
                         .tx_usage_counter
@@ -1373,17 +1380,17 @@ impl Bank {
                     recompiled
                         .ix_usage_counter
                         .fetch_add(program_to_recompile.ix_usage_counter.load(Relaxed), Relaxed);
-                    let mut loaded_programs_cache = new.loaded_programs_cache.write().unwrap();
-                    loaded_programs_cache.assign_program(key, recompiled);
+                    let mut program_cache = new.program_cache.write().unwrap();
+                    program_cache.assign_program(key, recompiled);
                 }
-            } else if new.epoch() != loaded_programs_cache.latest_root_epoch
+            } else if new.epoch() != program_cache.latest_root_epoch
                 || slot_index.saturating_add(slots_in_recompilation_phase) >= slots_in_epoch
             {
                 // Anticipate the upcoming program runtime environment for the next epoch,
                 // so we can try to recompile loaded programs before the feature transition hits.
-                drop(loaded_programs_cache);
+                drop(program_cache);
                 let (feature_set, _new_feature_activations) = new.compute_active_feature_set(true);
-                let mut loaded_programs_cache = new.loaded_programs_cache.write().unwrap();
+                let mut program_cache = new.program_cache.write().unwrap();
                 let program_runtime_environment_v1 = create_program_runtime_environment_v1(
                     &feature_set,
                     &new.runtime_config.compute_budget.unwrap_or_default(),
@@ -1395,7 +1402,7 @@ impl Bank {
                     &new.runtime_config.compute_budget.unwrap_or_default(),
                     false, /* debugging_features */
                 );
-                let mut upcoming_environments = loaded_programs_cache.environments.clone();
+                let mut upcoming_environments = program_cache.environments.clone();
                 let changed_program_runtime_v1 =
                     *upcoming_environments.program_runtime_v1 != program_runtime_environment_v1;
                 let changed_program_runtime_v2 =
@@ -1408,10 +1415,10 @@ impl Bank {
                     upcoming_environments.program_runtime_v2 =
                         Arc::new(program_runtime_environment_v2);
                 }
-                loaded_programs_cache.upcoming_environments = Some(upcoming_environments);
-                loaded_programs_cache.programs_to_recompile = loaded_programs_cache
+                program_cache.upcoming_environments = Some(upcoming_environments);
+                program_cache.programs_to_recompile = program_cache
                     .get_flattened_entries(changed_program_runtime_v1, changed_program_runtime_v2);
-                loaded_programs_cache
+                program_cache
                     .programs_to_recompile
                     .sort_by_cached_key(|(_id, program)| program.decayed_usage_counter(slot));
             }
@@ -1456,14 +1463,44 @@ impl Bank {
         );
 
         parent
-            .loaded_programs_cache
+            .program_cache
             .read()
             .unwrap()
             .stats
             .submit(parent.slot());
 
-        new.loaded_programs_cache.write().unwrap().stats.reset();
+        new.program_cache.write().unwrap().stats.reset();
         new
+    }
+
+    pub fn set_fork_graph_in_program_cache(&self, fork_graph: Arc<RwLock<BankForks>>) {
+        self.program_cache
+            .write()
+            .unwrap()
+            .set_fork_graph(fork_graph);
+    }
+
+    pub fn prune_program_cache(&self, new_root_slot: Slot, new_root_epoch: Epoch) {
+        self.program_cache
+            .write()
+            .unwrap()
+            .prune(new_root_slot, new_root_epoch);
+    }
+
+    pub fn prune_program_cache_by_deployment_slot(&self, deployment_slot: Slot) {
+        self.program_cache
+            .write()
+            .unwrap()
+            .prune_by_deployment_slot(deployment_slot);
+    }
+
+    pub fn get_runtime_environments_for_slot(&self, slot: Slot) -> ProgramRuntimeEnvironments {
+        let epoch = self.epoch_schedule.get_epoch(slot);
+        self.program_cache
+            .read()
+            .unwrap()
+            .get_environments_for_epoch(epoch)
+            .clone()
     }
 
     /// Epoch in which the new cooldown warmup rate for stake was activated
@@ -1483,7 +1520,10 @@ impl Bank {
         let epoch = self.epoch();
         let slot = self.slot();
         let (thread_pool, thread_pool_time) = measure!(
-            ThreadPoolBuilder::new().build().unwrap(),
+            ThreadPoolBuilder::new()
+                .thread_name(|i| format!("solBnkNewEpch{i:02}"))
+                .build()
+                .expect("new rayon threadpool"),
             "thread_pool_creation",
         );
 
@@ -1822,12 +1862,10 @@ impl Bank {
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
             accounts_data_size_delta_off_chain: AtomicI64::new(0),
             fee_structure: FeeStructure::default(),
-            loaded_programs_cache: Arc::new(RwLock::new(LoadedPrograms::new(
-                fields.slot,
-                fields.epoch,
-            ))),
+            program_cache: Arc::new(RwLock::new(ProgramCache::new(fields.slot, fields.epoch))),
             epoch_reward_status: fields.epoch_reward_status,
             transaction_processor: TransactionBatchProcessor::default(),
+            check_program_modification_slot: false,
         };
 
         bank.transaction_processor = TransactionBatchProcessor::new(
@@ -1836,7 +1874,7 @@ impl Bank {
             bank.epoch_schedule.clone(),
             bank.fee_structure.clone(),
             bank.runtime_config.clone(),
-            bank.loaded_programs_cache.clone(),
+            bank.program_cache.clone(),
         );
 
         bank.finish_init(
@@ -3912,12 +3950,10 @@ impl Bank {
         // Add a bogus executable account, which will be loaded and ignored.
         let (lamports, rent_epoch) = self.inherit_specially_retained_account_fields(&None);
 
-        // Mock account_data with executable_meta so that the account is executable.
-        let account_data = create_executable_meta(&owner);
         let account = AccountSharedData::from(Account {
             lamports,
             owner,
-            data: account_data.to_vec(),
+            data: vec![],
             executable: true,
             rent_epoch,
         });
@@ -4294,9 +4330,11 @@ impl Bank {
             // for processing. During forwarding, the transaction could expire if the
             // delay is not accounted for.
             MAX_PROCESSING_AGE - MAX_TRANSACTION_FORWARDING_DELAY,
-            enable_cpi_recording,
-            true,
-            true,
+            ExecutionRecordingConfig {
+                enable_cpi_recording,
+                enable_log_recording: true,
+                enable_return_data_recording: true,
+            },
             &mut timings,
             Some(&account_overrides),
             None,
@@ -4376,13 +4414,11 @@ impl Bank {
         account_overrides
     }
 
-    pub fn unlock_accounts(&self, batch: &mut TransactionBatch) {
-        if batch.needs_unlock() {
-            batch.set_needs_unlock(false);
-            self.rc
-                .accounts
-                .unlock_accounts(batch.sanitized_transactions().iter(), batch.lock_results())
-        }
+    pub fn unlock_accounts<'a>(
+        &self,
+        txs_and_results: impl Iterator<Item = (&'a SanitizedTransaction, &'a Result<()>)>,
+    ) {
+        self.rc.accounts.unlock_accounts(txs_and_results)
     }
 
     pub fn remove_unrooted_slots(&self, slots: &[(Slot, BankId)]) {
@@ -4547,9 +4583,7 @@ impl Bank {
         &self,
         batch: &TransactionBatch,
         max_age: usize,
-        enable_cpi_recording: bool,
-        enable_log_recording: bool,
-        enable_return_data_recording: bool,
+        recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         account_overrides: Option<&AccountOverrides>,
         log_messages_bytes_limit: Option<usize>,
@@ -4613,9 +4647,7 @@ impl Bank {
                 sanitized_txs,
                 &mut check_results,
                 &mut error_counters,
-                enable_cpi_recording,
-                enable_log_recording,
-                enable_return_data_recording,
+                recording_config,
                 timings,
                 account_overrides,
                 self.builtin_programs.iter(),
@@ -4951,7 +4983,7 @@ impl Bank {
             } = execution_result
             {
                 if details.status.is_ok() {
-                    let mut cache = self.loaded_programs_cache.write().unwrap();
+                    let mut cache = self.program_cache.write().unwrap();
                     cache.merge(programs_modified_by_tx);
                 }
             }
@@ -5641,9 +5673,7 @@ impl Bank {
         batch: &TransactionBatch,
         max_age: usize,
         collect_balances: bool,
-        enable_cpi_recording: bool,
-        enable_log_recording: bool,
-        enable_return_data_recording: bool,
+        recording_config: ExecutionRecordingConfig,
         timings: &mut ExecuteTimings,
         log_messages_bytes_limit: Option<usize>,
     ) -> (TransactionResults, TransactionBalancesSet) {
@@ -5664,9 +5694,7 @@ impl Bank {
         } = self.load_and_execute_transactions(
             batch,
             max_age,
-            enable_cpi_recording,
-            enable_log_recording,
-            enable_return_data_recording,
+            recording_config,
             timings,
             None,
             log_messages_bytes_limit,
@@ -5734,9 +5762,11 @@ impl Bank {
             &batch,
             MAX_PROCESSING_AGE,
             false, // collect_balances
-            false, // enable_cpi_recording
-            true,  // enable_log_recording
-            true,  // enable_return_data_recording
+            ExecutionRecordingConfig {
+                enable_cpi_recording: false,
+                enable_log_recording: true,
+                enable_return_data_recording: true,
+            },
             &mut ExecuteTimings::default(),
             Some(1000 * 1000),
         );
@@ -5772,9 +5802,7 @@ impl Bank {
             batch,
             MAX_PROCESSING_AGE,
             false,
-            false,
-            false,
-            false,
+            ExecutionRecordingConfig::new_single_setting(false),
             &mut ExecuteTimings::default(),
             None,
         )
@@ -5866,10 +5894,6 @@ impl Bank {
             .accounts
             .accounts_db
             .flush_accounts_cache(false, Some(self.slot()))
-    }
-
-    pub fn expire_old_recycle_stores(&self) {
-        self.rc.accounts.accounts_db.expire_old_recycle_stores()
     }
 
     /// Technically this issues (or even burns!) new lamports,
@@ -5985,10 +6009,10 @@ impl Bank {
             }
         }
 
-        let mut loaded_programs_cache = self.loaded_programs_cache.write().unwrap();
-        loaded_programs_cache.latest_root_slot = self.slot();
-        loaded_programs_cache.latest_root_epoch = self.epoch();
-        loaded_programs_cache.environments.program_runtime_v1 = Arc::new(
+        let mut program_cache = self.program_cache.write().unwrap();
+        program_cache.latest_root_slot = self.slot();
+        program_cache.latest_root_epoch = self.epoch();
+        program_cache.environments.program_runtime_v1 = Arc::new(
             create_program_runtime_environment_v1(
                 &self.feature_set,
                 &self.runtime_config.compute_budget.unwrap_or_default(),
@@ -5997,7 +6021,7 @@ impl Bank {
             )
             .unwrap(),
         );
-        loaded_programs_cache.environments.program_runtime_v2 =
+        program_cache.environments.program_runtime_v2 =
             Arc::new(create_program_runtime_environment_v2(
                 &self.runtime_config.compute_budget.unwrap_or_default(),
                 false, /* debugging_features */
@@ -7066,7 +7090,7 @@ impl Bank {
         debug!("Adding program {} under {:?}", name, program_id);
         self.add_builtin_account(name.as_str(), &program_id, false);
         self.builtin_programs.insert(program_id);
-        self.loaded_programs_cache
+        self.program_cache
             .write()
             .unwrap()
             .assign_program(program_id, Arc::new(builtin));
@@ -7371,7 +7395,7 @@ impl Bank {
                 self.store_account(new_address, &AccountSharedData::default());
 
                 // Unload a program from the bank's cache
-                self.loaded_programs_cache
+                self.program_cache
                     .write()
                     .unwrap()
                     .remove_programs([*old_address].into_iter());
@@ -7493,7 +7517,7 @@ impl Bank {
     }
 
     pub fn check_program_modification_slot(&mut self) {
-        self.transaction_processor.check_program_modification_slot = true;
+        self.check_program_modification_slot = true;
     }
 
     pub fn load_program(
@@ -7503,7 +7527,7 @@ impl Bank {
         effective_epoch: Epoch,
     ) -> Arc<LoadedProgram> {
         self.transaction_processor
-            .load_program(self, pubkey, reload, effective_epoch)
+            .load_program_with_pubkey(self, pubkey, reload, effective_epoch)
     }
 }
 
@@ -7553,6 +7577,18 @@ impl TransactionProcessingCallback for Bank {
             })
         } else {
             Ok(())
+        }
+    }
+
+    fn get_program_match_criteria(&self, program: &Pubkey) -> LoadedProgramMatchCriteria {
+        if self.check_program_modification_slot {
+            self.transaction_processor
+                .program_modification_slot(self, program)
+                .map_or(LoadedProgramMatchCriteria::Tombstone, |slot| {
+                    LoadedProgramMatchCriteria::DeployedOnOrAfterSlot(slot)
+                })
+        } else {
+            LoadedProgramMatchCriteria::NoCriteria
         }
     }
 }
